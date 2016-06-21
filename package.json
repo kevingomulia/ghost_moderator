@@ -1,0 +1,21 @@
+{
+  "name": "ghost_moderator",
+  "version": "1.0.0",
+  "description": "A Telegram bot to find your way around town and track your friends.",
+  "main": "bot.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Pyriaxis",
+  "license": "ISC",
+  "dependencies": {
+    "async": "^2.0.0-rc.6",
+    "bluebird": "^3.3.5",
+    "cron": "^1.1.0",
+    "lodash": "^4.13.1",
+    "memory-lock": "^1.0.5",
+    "mongojs": "^2.4.0",
+    "mongoose": "^4.4.14",
+    "telebot": "*"
+  }
+}
