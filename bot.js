@@ -7,6 +7,7 @@ var fs = require('fs');
 var _ = require('lodash');
 var memoryLock = require('memory-lock');
 var async = require('async');
+var rotate = require('rotate-array');
 
 const bot = new TeleBot({
     token: cfg.config.apiKey || '', // Required.
@@ -23,8 +24,30 @@ const wordDatabase = [
   ['test1', 'test2']
 ];
 
+const dummyNames = [
+    {firstName: 'dummyplayer1',
+    lastName: 'dunce',
+    id: 123,
+    username: 'dp1' },
+    {firstName: 'dummyplayer2',
+        lastName: 'doink',
+        id: 124,
+        username: 'dp2'},
+    {firstName: 'dummyplayer3',
+        lastName: 'dimple',
+        id: 125,
+        username: 'dp3'},
+    {firstName: 'dummyplayer4',
+        lastName: 'domce',
+        id: 126,
+        username: 'dp4'},
+    {firstName: 'dummyplayer5',
+        lastName: 'dimdum',
+        id: 127,
+        username: 'dp5'}
+];
 
-const playersArray = [ //villager A, villager B, ghost, idiot
+const gamePlayersArray = [ //villager A, villager B, ghost, idiot
     null,//0
     null,//1
     [1,0,1,0],//2
@@ -39,17 +62,28 @@ const playersArray = [ //villager A, villager B, ghost, idiot
     [6,3,2,1],//11
     [6,3,2,2],//12
 ];
+
+const sessionRegex = /([-]\d+)[.](\d+)/;
+const voteRegex = /([-]]\d+)[.][v][.](\d+)/;
 //DB Logic
 
-var word1 = [112668532];
-var word2 = [112668532];
+var word1 = [];
+var word2 = [];
 var readyToConfirm = [];
 
+var canVote = {};
+var canGhost = {};
+
+var toAnswer: {};
+var gameInSession = {};
+var toVote: {};
 
 var mongojs = require('mongojs');
 var db = mongojs('ghostgame', ['users', 'sessions']);
 
-db.sessions.findOne({'moderator.id': 112668532}, function(err, userdocs){
+var chatId = (-52762427).toString() + '.role';
+
+db.users.findOne({[chatId]: 'villager2'}, function(err, userdocs){
    console.log(userdocs);
 });
 
@@ -65,6 +99,20 @@ var getSessionModerator = function(fromId, callback){
     });
 };
 
+var getUser = function(userId, callback){
+    return db.users.findOne({id: userId}, function (err, userdocs) {
+        callback(err,userdocs);
+    });
+};
+
+var getUserByRole = function(chatId, role, callback){
+    let queryString = chatId.toString() + '.role';
+
+    return db.users.findOne({[queryString]: role}, function (err, userdocs) {
+        callback(err,userdocs);
+    });
+};
+
 var addPlayer = function(sessionId, playerData, chatId){
 
     db.sessions.findOne({_id: sessionId}, (err, ses) => {
@@ -75,9 +123,9 @@ var addPlayer = function(sessionId, playerData, chatId){
                 new: true
             }, function(err, doc, lastErrorObject)
             {
-                updateSessionStatus(chatId, ses.messageId);
+                updateSessionStatus(chatId);
             });
-        //}
+        //};
     });
 };
 
@@ -152,7 +200,6 @@ var moderateNewGame = function(fromId, username, chatId){
                                 username: username,
                                 chatId: chatId
                             });
-
                             return callback(null, 'initialized');
                         }
                     });
@@ -170,8 +217,6 @@ var moderateNewGame = function(fromId, username, chatId){
         }
     });
 };
-
-
 
 var initializeJoin = function(data){
     db.sessions.findAndModify({
@@ -232,23 +277,24 @@ var confirmSessionWords = function(fromId){
             }
         },
     }, (err, doc, lastErrorObject) => {
-        return;
+        updateSessionStatus(doc.chatId);
     });
-}
+};
 
-var updateSessionStatus = function (chatId, messageId){
+var updateSessionStatus = function (chatId){
     getSession(chatId, function(err, sesdoc){
         var playerNameString = "";
+
+        let messageId = sesdoc.messageId;
 
         _.forEach(sesdoc.playersArray, playerData => {
             playerNameString += ( playerData.username || playerData.firstName + " " + playerData.lastName ) + "\n";
         });
 
-        console.log(playerNameString);
 
         let message = "<b>Moderator:</b> " + (sesdoc.moderator.username || sesdoc.moderator.id) +
             "\n<b>Current Players:</b> " + sesdoc.playersArray.length +
-            "\n" + playerNameString;
+            "\n" + playerNameString + (sesdoc.wordsDone ? "\n<b>Words have been chosen.</b>" : "");
 
         bot.editText({chatId, messageId}, message, {parse: 'html'});
     });
@@ -265,7 +311,7 @@ var updateMessageStatus = function(chatId){
 
         let message = "<b>Moderator:</b> " + (sesdoc.moderator.username || sesdoc.moderator.id) +
         "\n<b>Current Players:</b> " + sesdoc.playersArray.length +
-        "\n" + playerNameString;
+        "\n" + playerNameString + (sesdoc.wordsDone ? "\n<b>Words have been chosen.</b>" : "");
 
         bot.sendMessage(chatId, message, {parse: 'html'}).then(re => {
             let newMessageId = re.result.message_id;
@@ -283,14 +329,209 @@ var updateMessageStatus = function(chatId){
     });
 };
 
-var startGame = function(chatId){
+var startGame = function(chatId, fromId){
     getSession(chatId, (err, sesdoc) => {
 
+        if ((sesdoc.moderator.id === fromId) && !sesdoc.started)
+        {
+            let playersArray = _.shuffle(sesdoc.playersArray);
 
+            console.log(playersArray);
+            console.log(sesdoc.playersArray);
 
-
+            parsePlayers(playersArray, chatId);
+            startGameDB(chatId);
+            initializeGhost(chatId);
+        } else {
+            return;
+        }
     });
-}
+};
+
+var startGamePhase2 = function(chatId, index){
+    var rotArray;
+
+    getSession(chatId, (err, sesdoc)=>{
+         bot.sendMessage(chatId, "The ghost has chosen <b>" + sesdoc.playersArray[index].username || sesdoc.playersArray[index].firstName
+             + "</b> to start. \n\nPlease PM @ghostgame_moderator with your phrase.", {parse: 'html'});
+        rotArray = sesdoc.playersArray;
+        rotate(rotArray, index);
+
+        db.sessions.findAndModify({
+            query: { chatId: chatId },
+            update: {
+                $set: {
+                    playersArray: rotArray
+                }
+            },
+        }, (err, doc, lastErrorObject) => {
+            initializeRound(chatId, rotArray);
+        });
+     });
+};
+
+var initializeGhost = function(chatId){
+
+    getSession(chatId, (err, sesdoc)=>{
+        let pArray = sesdoc.playersArray;
+        let keyArray = [];
+        for (var i = 0; i< pArray.length; i++){
+            keyArray.push([bot.inlineButton( sesdoc.playersArray[i].username || sesdoc.playersArray[i].firstName, {callback: chatId.toString()+'.'+i.toString()})]);
+        }
+
+        let markup = bot.inlineKeyboard(keyArray);
+
+        getUserByRole(chatId, 'ghost', (err, userdoc)=>{
+            canGhost[chatId] = userdoc.id;
+            bot.sendMessage(userdoc.id, "The order of players goes from top to bottom, looping back to the top. Whom do you choose to start at?", {markup});
+        });
+    })
+};
+
+var initializeRound = function(chatId, playerArray){
+    gameInSession[chatId] = {playersArray: playerArray, ansArray: [], count: 0};
+    toAnswer[playerArray[0].id] = chatId.toString();
+    bot.sendMessage(playerArray[0].id, "It is your turn. Please reply with a phrase.");
+};
+
+var nextPlayer = function(chatId){
+    let gameSession = gameInSession[chatId];
+
+    bot.sendMessage(chatId, "<b>" + (gameSession.playersArray[gameSession.count-1].username || gameSession.playersArray[gameSession.count-1].firstName)
+        + "</b> phrase is: \n" + gameSession.ansArray[gameSession.count-1], {parse: 'html'});
+
+    if (gameSession.count === gameSession.playersArray){
+        questioningRound(chatId);
+    } else {
+        toAnswer[gameSession.playersArray[gameSession.count]] = chatId;
+        bot.sendMessage(playerArray[0].id, "It is your turn. Please reply with a phrase.");
+    }
+};
+
+var questioningRound = function(chatId){
+    let gameSession = gameInSession[chatId];
+    let keyArray = [];
+    var idArray = [];
+    toVote[chatId] = [];
+
+    let recapString = "The round is over. Here's a recap: \n";
+    for (var i = 0; i < gameSession.playersArray.length; i++){
+        recapString += "<b>" + (gameSession.playersArray[i].username || gameSession.playersArray[i].firstName)
+            + "</b> phrase is: \n" + gameSession.ansArray[i] + "\n\n";
+        keyArray.push([bot.inlineButton(gameSession.playersArray[i].username || gameSession.playersArray[i].firstName, {callback:chatId.toString()+'.v.'+i.toString()})]);
+        idArray.push(gameSession.playersArray[i].id);
+        toVote[chatId].push(0);
+    };
+
+    let markup = bot.inlineKeyboard(keyArray);
+    canVote[chatId] = idArray;
+
+    recapString += "Now, vote for who you think is the Ghost! You have 20 seconds...";
+    bot.SendMessage(chatId, recapString, {parse: 'html', markup});
+
+
+    setTimeout(function(){
+        let max = _.max(toVote[chatId]);
+    }, 20000);
+};
+
+var parsePlayerW1 = function(player, chatId){
+    var session = chatId.toString();
+
+    db.users.findAndModify({
+        query: { id: player.id },
+        update: {
+            $set: {
+               [session] : {role: 'villager1', alive: true}
+            }
+        },
+    }, (err, doc, lastErrorObject) => {
+        return;
+    });
+    
+    getSession(chatId, (err, sesdoc) => {
+        bot.sendMessage(player.id, "You are a villager!\n This is your word: <b>" +
+            sesdoc.words.word1 + "</b>\n\nRemember not to be overly specific and clue the ghost in too easily.", {parse: 'html'});
+    })
+};
+
+var parsePlayerW2 = function(player, chatId){
+    var session = chatId.toString();
+
+    db.users.findAndModify({
+        query: { id: player.id },
+        update: {
+            $set: {
+                [session] : {role: 'villager2', alive: true}
+            }
+        },
+    }, (err, doc, lastErrorObject) => {
+        return;
+    });
+
+    getSession(chatId, (err, sesdoc) => {
+        bot.sendMessage(player.id, "You are a villager!\n This is your word: <b>" +
+            sesdoc.words.word2 + "</b>\n\nRemember not to be overly specific and clue the ghost in too easily.", {parse: 'html'});
+    });
+};
+
+var parsePlayerGhost = function(player, chatId){
+    var session = chatId.toString();
+
+    db.users.findAndModify({
+        query: { id: player.id },
+        update: {
+            $set: {
+                [session] : {role: 'ghost', alive: true}
+            }
+        },
+    }, (err, doc, lastErrorObject) => {
+        return;
+    });
+
+    getSession(chatId, (err, sesdoc) => {
+        bot.sendMessage(player.id, "You are a <b>GHOST</b>\n\nTry to deduce either word while blending in with the villagers.\n\nOnce you feel you have the answer, /guess it!", {parse: 'html'});
+    });
+};
+
+var parsePlayerIdiot = function(player,chatId){
+    var session = chatId.toString();
+
+    db.users.findAndModify({
+        query: { id: player.id },
+        update: {
+            $set: {
+                [session] : {role: 'idiot', alive: true}
+            }
+        },
+    }, (err, doc, lastErrorObject) => {
+        return;
+    });
+
+    getSession(chatId, (err, sesdoc) => {
+        bot.sendMessage(player.id, "You are the IDIOT!\n These are the words: <b>" +
+            sesdoc.words.word1 + "</b>\n+<b>" + sesdoc.words.word2 + "</b>\nAct like the ghost in order to get voted out!.", {parse: 'html'});
+    })
+};
+
+var parsePlayers = function(inputArray, chatId){
+    let count = 0;
+    for (var i = 0; i < 4; i++)
+    {
+        for (var j = 0; j < gamePlayersArray[inputArray.length][i]; j++){
+            if (i === 0){  //word 1
+                parsePlayerW1(inputArray[count], chatId);
+            } else if (i === 1){ //word 2
+                parsePlayerW2(inputArray[count], chatId);
+            } else if (i === 2){ // ghost
+                parsePlayerGhost(inputArray[count], chatId);
+            } else { // idiot
+                parsePlayerIdiot(inputArray[count], chatId);
+            }
+            count++;
+        }
+    }
+};
 
 //Bot Logic
 
@@ -309,7 +550,7 @@ bot.on(['/start'], msg => {
             if ((docs.length) > 0 ) {
                 return bot.sendMessage(msg.from.id, "Hey there, you have already registered as a player of <b>Ghost</b>. Get out there and start hunting!", {parse: 'html'});
             } else {
-                db.users.insert({id: msg.from.id, name: msg.from.username});
+                db.users.insert({id: msg.from.id, name: (msg.from.username || (msg.from.first_name)) });
                 return bot.sendMessage(msg.from.id, "Hey there, you have been successfully registered as a player of <b>Ghost</b>.", {parse: 'html'});
             }
         });
@@ -322,15 +563,26 @@ bot.on(['/start'], msg => {
 
 bot.on(['/join'], msg =>{
     if (msg.chat.type === 'group' || msg.chat.type === 'supergroup'){
-        getSession(msg.chat.id, function(err, sesdocs){
-            if (sesdocs && !sesdocs.started)
-            {
-                addPlayer(sesdocs._id, msg.from.username);
-                updateSessionStatus(msg.message.chat.id, sesdocs.messageId);
+        getUser(msg.from.id, (err, userdoc)=> {
+            if (userdoc){
+                getSession(msg.chat.id, function(err, sesdoc){
+                    if (sesdoc && !sesdoc.started)
+                    {
+                        addPlayer(sesdoc._id, {
+                            firstName: msg.from.first_name,
+                            lastName: msg.from.last_name,
+                            id: msg.from.id,
+                            username: msg.from.username
+                        }, msg.chat.id);
+                        bot.sendMessage(msg.chat.id, (msg.from.username || msg.from.first_name) + " has joined the game. /join");
+                    } else {
+                        return;
+                    }
+                });
             } else {
-                return;
+                bot.sendMessage(msg.chat.id, msg.from.first_name + ', please PM me @ghostgame_bot before joining a game so that I can message you the role.');
             }
-        }) ;
+        });
     }
 });
 
@@ -345,6 +597,14 @@ bot.on(['/status'], msg =>{
             }
         }) ;
     }
+});
+
+bot.on(['/startgame'], msg=>{
+    startGame(msg.chat.id);
+});
+
+bot.on(['/debug'], msg => {
+    initializeGhost(msg.chat.id);
 });
 
 bot.on(['/yes'], msg=>{
@@ -367,32 +627,101 @@ bot.on('callbackQuery', msg => {
 
     bot.answerCallback(msg.id, '', false);
 
-    if (msg.data === 'commands'){
+    let match = sessionRegex.exec(msg.data);
+    let match2 = voteRegex.exec(msg.data);
+
+    if (match !== null) {
+
+        console.log(match);
+        let chatId = parseInt(match[1]);
+        let index = parseInt(match[2]);
+
+        if (canGhost[chatId] !== msg.from.id)
+        {
+            return;
+        }
+        delete canGhost[chatId];
+
+        startGamePhase2(chatId, index);
+        // getSession(chatId, (err, sesdoc)=>{
+        //     bot.sendMessage(chatId, "pulled.. " + sesdoc.playersArray[index].username || sesdoc.playersArray[index].firstName);
+        // });
+        return;
+    } else if (match2 !== null){
+        console.log(match2);
+        let chatId = (match[1]);
+        let index = (match[2]);
+
+        if (_.indexOf(canVote[chatId], msg.from.id) === -1)
+        {
+            return;
+        }
+
+        canVote[chatId] = _.without(canVote[chatId], msg.from.id);
+        if (_.isEmpty(canVote[chatId])){
+            delete canVote[chatId];
+        }
+
+        toVote[chatId][index] = toVote[chatId][index] + 1;
+    } else if (msg.data === 'commands'){
         //return bot.sendMessage(msg.chat.id, "What is your <b>starting</b> location?", {parse: 'html', markup});
     } else if (msg.data === 'moderategame') {
         return moderateNewGame(msg.from.id, msg.from.username, msg.message.chat.id);
     } else if (msg.data ==='join'){
-        getSession(msg.message.chat.id, function(err, sesdocs){
-            if (sesdocs && !sesdocs.started)
-            {
-                addPlayer(sesdocs._id, {
-                    firstName: msg.from.first_name,
-                    lastName: msg.from.last_name,
-                    id: msg.from.id,
-                    username: msg.from.username
-                }, msg.message.chat.id);
+        getUser(msg.from.id, (err, userdoc)=> {
+            if (userdoc){
+                getSession(msg.message.chat.id, function(err, sesdoc){
+                    if (sesdoc && !sesdoc.started)
+                    {
+                        addPlayer(sesdoc._id, {
+                            firstName: msg.from.first_name,
+                            lastName: msg.from.last_name,
+                            id: msg.from.id,
+                            username: msg.from.username
+                        }, msg.message.chat.id);
+                        bot.sendMessage(msg.message.chat.id, (msg.from.username || msg.from.first_name) + " has joined the game. /join");
+                    } else {
+                        return;
+                    }
+                });
             } else {
-                return;
+                bot.sendMessage(msg.message.chat.id, (msg.from.username || msg.from.first_name) + ', please PM me @ghostgame_bot before joining a game so that I can message you the role.');
             }
-        }) ;
+        });
     };
     //return bot.sendMessage(msg.from.id, "Pressed the " + msg.data + " button!");
 });
 
+bot.on(['/add_player_debug'], msg =>{
+    getSession(msg.chat.id, function(err, sesdocs){
+        if (sesdocs && !sesdocs.started)
+        {
+            addPlayer(sesdocs._id, dummyNames[0], msg.chat.id);
+            addPlayer(sesdocs._id, dummyNames[1], msg.chat.id);
+            addPlayer(sesdocs._id, dummyNames[2], msg.chat.id);
+            addPlayer(sesdocs._id, dummyNames[3], msg.chat.id);
+            addPlayer(sesdocs._id, dummyNames[4], msg.chat.id);
+            bot.sendMessage(msg.chat.id, "Dummy players have joined the game. /join");
+        } else {
+            return;
+        }
+    }) ;
+});
+
 bot.on('text', msg => {
 
+    if (msg.chat.type !== 'private')
+    {
+        return;
+    }
     //console.log(msg);
-    if (_.indexOf(word1, msg.from.id) !== -1){
+    if (toAnswer[msg.from.id] !== undefined){
+        var chatId = toAnswer[msg.from.id];
+        gameInSession[chatId].ansArray.push(msg.text);
+        gameInSession[chatId].count = gameInSession[chatId].count + 1;
+        delete toAnswer[msg.from.id];
+        nextPlayer(chatId);
+    } else if (_.indexOf(word1, msg.from.id) !== -1){
         updateSessionWord1(msg.from.id, msg.text);
         word1 = _.without(word1, msg.from.id);
 
@@ -407,14 +736,10 @@ bot.on('text', msg => {
         getSessionModerator(msg.from.id, (err, sesdoc) => {
             let w1 = sesdoc.words.word1;
             let w2 = sesdoc.words.word2;
-            return bot.sendMessage.(msg.from.id, "The two words you have inputted are:\n<b>" + w1 + "</b>\n<b>" + w2 + "</b>\n\nPlease enter /yes to confirm, /no to redo.", {parse: 'html'});
+            return bot.sendMessage(msg.from.id, "The two words you have inputted are:\n<b>" + w1 + "</b>\n<b>" + w2 + "</b>\n\nPlease enter /yes to confirm, /no to redo.", {parse: 'html'});
         });
     };
-
-    if (msg.text === "Manual Entry") {
-        return bot.sendMessage(msg.chat.id, 'Please type in your starting location.', {markup: 'hide', ask: 'origin'});
-    };
-})
+});
 
 //Initialization
 bot.connect();

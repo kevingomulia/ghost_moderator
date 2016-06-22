@@ -16,6 +16,7 @@
     "memory-lock": "^1.0.5",
     "mongojs": "^2.4.0",
     "mongoose": "^4.4.14",
+    "rotate-array": "^1.1.0",
     "telebot": "*"
   }
 }
